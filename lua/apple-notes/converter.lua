@@ -22,19 +22,6 @@ local job = require("apple-notes.job")
 
 local M = {}
 
---- Strip base64 data URIs from HTML before conversion.
----
---- Apple Notes embeds images as base64 data URIs which can be hundreds of KB.
---- Replace them with a placeholder to keep buffers lightweight.
----
---- @param html string The raw HTML
---- @return string The HTML with data URIs replaced
-local function strip_base64_images(html)
-  return html
-    :gsub('<img[^>]*src="data:image/[^"]*"[^>]*/>', "[image]")
-    :gsub('<img[^>]*src="data:image/[^"]*"[^>]*>', "[image]")
-end
-
 --- Pre-process Apple Notes HTML into standard HTML before pandoc conversion.
 ---
 --- Apple Notes wraps every line in <div>...</div>. Instead of stripping divs
@@ -57,9 +44,6 @@ end
 --- @param html string The raw Apple Notes HTML
 --- @return string Standard HTML suitable for pandoc
 local function preprocess_html(html)
-  -- Strip base64 images first
-  html = strip_base64_images(html)
-
   -- Phase 1: Strip ghost heading line-break artifacts.
   -- Apple Notes appends <b><span style="font-size:NNpx"><hN><br></hN></span></b>
   -- after real headings, producing empty duplicate headings.
@@ -321,7 +305,9 @@ local function postprocess_markdown(md)
   end
   result = table.concat(bs_out, "\n")
 
-  -- Remove stray backslashes at end of lines (pandoc line break artifacts)
+  -- Remove stray backslashes at end of lines (pandoc line break artifacts).
+  -- Lua's $ only matches end-of-string, so also match \ before newlines.
+  result = result:gsub("\\%s*\n", "\n")
   result = result:gsub("\\%s*$", "")
 
   -- Remove escaped brackets around [image] placeholder
@@ -399,33 +385,53 @@ end
 --- Pre-processes Apple Notes HTML into standard HTML, then uses pandoc
 --- with gfm (GitHub Flavored Markdown) for clean output.
 ---
+--- When note_id is provided, base64 <img> tags are replaced with file://
+--- paths to the actual image files on disk before pandoc conversion.
+---
 --- @param html string The HTML content from Apple Notes
 --- @param callback fun(err: string|nil, markdown: string|nil) Called with converted content
-function M.html_to_md(html, callback)
+--- @param note_id number|nil The note's Z_PK for image resolution (optional)
+function M.html_to_md(html, callback, note_id)
   if not html or html == "" then
     callback(nil, "")
     return
   end
 
-  local cleaned = preprocess_html(html)
+  --- Run pandoc conversion after image resolution.
+  --- @param resolved_html string HTML with images resolved or stripped
+  local function do_convert(resolved_html)
+    local cleaned = preprocess_html(resolved_html)
 
-  job.run(
-    { "pandoc", "-f", "html", "-t", "gfm", "--wrap=none" },
-    { input = cleaned, timeout = 10000 },
-    function(err, result)
-      if err then
-        callback("HTML to Markdown conversion failed: " .. err, nil)
-        return
+    job.run(
+      { "pandoc", "-f", "html", "-t", "gfm", "--wrap=none" },
+      { input = cleaned, timeout = 10000 },
+      function(err, result)
+        if err then
+          callback("HTML to Markdown conversion failed: " .. err, nil)
+          return
+        end
+        callback(nil, postprocess_markdown(result or ""))
       end
-      callback(nil, postprocess_markdown(result or ""))
-    end
-  )
+    )
+  end
+
+  -- Resolve base64 images to file paths before pandoc if note_id provided
+  if note_id and html:match("data:image/") then
+    local images = require("apple-notes.images")
+    images.resolve_images_in_html(html, note_id, do_convert)
+  else
+    do_convert(html)
+  end
 end
 
 --- Convert Markdown to HTML using pandoc, then post-process for Apple Notes.
 ---
 --- Converts gfm markdown to HTML, then transforms pandoc's semantic HTML
 --- into Apple Notes' div-wrapped format for proper display in the app.
+---
+--- Any file:// image references are stripped before conversion since Apple
+--- Notes' `set body` silently drops <img> tags. Images in Apple Notes are
+--- managed as attachments and are not affected by body updates.
 ---
 --- @param markdown string The Markdown content from the buffer
 --- @param callback fun(err: string|nil, html: string|nil) Called with converted content
@@ -435,7 +441,11 @@ function M.md_to_html(markdown, callback)
     return
   end
 
-  job.run({ "pandoc", "-f", "gfm", "-t", "html" }, { input = markdown, timeout = 10000 }, function(err, result)
+  -- Strip file:// images before conversion (read-only, can't write back)
+  local images = require("apple-notes.images")
+  local clean_md = images.strip_local_images(markdown)
+
+  job.run({ "pandoc", "-f", "gfm", "-t", "html" }, { input = clean_md, timeout = 10000 }, function(err, result)
     if err then
       callback("Markdown to HTML conversion failed: " .. err, nil)
       return

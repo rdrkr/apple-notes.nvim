@@ -289,6 +289,61 @@ end tell]],
   end)
 end
 
+--- Get note IDs and bodies for all notes via a single batch AppleScript call.
+---
+--- Returns a delimited string of note-id/body pairs for tag extraction.
+--- Uses a unique delimiter to separate records and fields since note bodies
+--- can contain arbitrary text.
+---
+--- @param callback fun(err: string|nil, notes: { id: string, body: string }[]|nil)
+function M.get_all_note_bodies(callback)
+  local record_sep = "<<<ANOTE_REC>>>"
+  local field_sep = "<<<ANOTE_FLD>>>"
+  local script = string.format(
+    [[tell application "Notes"
+  set noteCount to count of notes
+  if noteCount > 500 then set noteCount to 500
+  set output to ""
+  repeat with i from 1 to noteCount
+    set theNote to note i
+    set noteId to id of theNote
+    set noteBody to body of theNote
+    if i > 1 then set output to output & "%s"
+    set output to output & noteId & "%s" & noteBody
+  end repeat
+  return output
+end tell]],
+    record_sep,
+    field_sep
+  )
+
+  run(script, function(err, result)
+    if err then
+      callback(err, nil)
+      return
+    end
+
+    local notes = {}
+    if not result or result == "" then
+      callback(nil, notes)
+      return
+    end
+
+    local records = vim.split(result, record_sep, { plain = true })
+    for _, record in ipairs(records) do
+      local parts = vim.split(record, field_sep, { plain = true, trimempty = false })
+      if #parts >= 2 then
+        table.insert(notes, {
+          id = parts[1],
+          body = table.concat(parts, field_sep, 2), -- rejoin in case body contains delimiter
+        })
+      end
+    end
+
+    callback(nil, notes)
+  end)
+end
+
 --- Append text to a note's body.
 ---
 --- Used by the quick capture command.

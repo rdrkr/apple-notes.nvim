@@ -71,6 +71,50 @@ function M.get_open_buffer(identifier)
   return nil
 end
 
+--- Configure a buffer as an Apple Notes virtual buffer.
+---
+--- Sets the essential buffer options that prevent Neovim from treating
+--- this as a real file. Order matters: buftype must be set before filetype
+--- to prevent LSP clients from attaching when the FileType autocmd fires.
+---
+--- @param bufnr number The buffer number
+local function configure_buffer_options(bufnr)
+  vim.bo[bufnr].swapfile = false
+  vim.bo[bufnr].buftype = "acwrite"
+  vim.bo[bufnr].filetype = "markdown"
+end
+
+--- Populate buffer content and finalize setup after async load.
+---
+--- @param bufnr number The buffer number
+--- @param markdown string The markdown content
+local function set_buffer_content(bufnr, markdown)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  local lines = vim.split(markdown or "", "\n")
+  vim.bo[bufnr].modifiable = true
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+  vim.bo[bufnr].modified = false
+  vim.api.nvim_buf_set_var(bufnr, "apple_note_loaded_at", os.time())
+
+  -- Re-set buffer options after content load — Neovim's filetype detection
+  -- may have overridden our initial setting since the buffer name has no
+  -- .md extension, and ftplugin autocmds may reset buftype.
+  configure_buffer_options(bufnr)
+
+  -- Re-fire BufWinEnter so markdown rendering plugins (e.g. render-markdown.nvim)
+  -- detect the buffer after async content load. The original BufWinEnter fires
+  -- before filetype="markdown" is set and buffer lines are populated.
+  vim.schedule(function()
+    if not vim.api.nvim_buf_is_valid(bufnr) then
+      return
+    end
+    vim.api.nvim_exec_autocmds("BufWinEnter", { buffer = bufnr })
+  end)
+end
+
 --- Open a note in a virtual buffer.
 ---
 --- If the note is already open, focuses the existing buffer instead of
@@ -79,6 +123,12 @@ end
 --- @param note table The note data from db.get_notes()
 --- @param config table The plugin config
 function M.open_note(note, config)
+  -- Validate required fields
+  if not note or not note.id or not note.identifier then
+    vim.notify("Cannot open note: missing required data", vim.log.levels.ERROR)
+    return
+  end
+
   -- Check for existing buffer
   local existing = M.get_open_buffer(note.identifier)
   if existing then
@@ -94,21 +144,15 @@ function M.open_note(note, config)
     pcall(vim.api.nvim_buf_delete, stale, { force = true })
   end
 
-  -- Create buffer
+  -- Create buffer and set options before making it current — this prevents
+  -- LSP attachment and swap file creation from the BufEnter/BufWinEnter events.
   local bufnr = vim.api.nvim_create_buf(true, false)
+  configure_buffer_options(bufnr)
   vim.api.nvim_buf_set_name(bufnr, bufname)
+  vim.bo[bufnr].modifiable = false
   vim.api.nvim_set_current_buf(bufnr)
 
-  -- Set buffer options — filetype BEFORE buftype, because filetype triggers
-  -- ftplugin autocommands that may reset buftype. Setting buftype last ensures
-  -- it stays as "acwrite" so :w fires BufWriteCmd instead of a file write.
-  vim.bo[bufnr].filetype = "markdown"
-  vim.bo[bufnr].buftype = "acwrite"
-  vim.bo[bufnr].swapfile = false
-  vim.bo[bufnr].modifiable = false
-
-  -- Store note metadata in buffer variables.
-  -- Use nvim_buf_set_var (the API function) instead of vim.b[] shorthand
+  -- Store note metadata via the API function (not vim.b[] shorthand)
   -- to ensure variables are set on the correct buffer regardless of context.
   vim.api.nvim_buf_set_var(bufnr, "apple_note_id", note.id)
   vim.api.nvim_buf_set_var(bufnr, "apple_note_identifier", note.identifier)
@@ -135,11 +179,12 @@ function M.open_note(note, config)
   -- Set up winbar
   M._setup_winbar(bufnr, note)
 
-  -- Clean up tracking state on buffer delete (no buf_delete call — already being deleted)
+  -- Clean up tracking state on buffer delete
+  local note_identifier = note.identifier
   vim.api.nvim_create_autocmd("BufDelete", {
     buffer = bufnr,
     callback = function()
-      open_buffers[note.identifier] = nil
+      open_buffers[note_identifier] = nil
       buffer_meta[bufnr] = nil
       sync.unregister_buffer(bufnr)
     end,
@@ -152,14 +197,15 @@ function M.open_note(note, config)
   vim.bo[bufnr].modifiable = false
 
   -- Fetch note body via AppleScript
-  applescript.get_note_body(note.id, function(err, html)
+  local note_id = note.id
+  applescript.get_note_body(note_id, function(err, html)
     if err then
       vim.notify("Failed to load note: " .. err, vim.log.levels.ERROR)
-      M._close_buffer(bufnr, note.identifier)
+      M._close_buffer(bufnr, note_identifier)
       return
     end
 
-    -- Convert HTML to Markdown
+    -- Convert HTML to Markdown (pass note_id for image resolution)
     converter.html_to_md(html or "", function(conv_err, markdown)
       if conv_err then
         if conv_err:match("not installed") or conv_err:match("not executable") then
@@ -171,28 +217,13 @@ function M.open_note(note, config)
         markdown = html or ""
       end
 
-      if not vim.api.nvim_buf_is_valid(bufnr) then
-        return
-      end
-
-      -- Set buffer content
-      local lines = vim.split(markdown or "", "\n")
-      vim.bo[bufnr].modifiable = true
-      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
-      vim.bo[bufnr].modified = false
-      vim.b[bufnr].apple_note_loaded_at = os.time()
-
-      -- Re-set filetype after content load — Neovim's filetype detection may
-      -- have overridden our initial setting since the buffer name has no .md extension.
-      vim.bo[bufnr].filetype = "markdown"
-
-      -- Re-set buftype after filetype — some ftplugin autocommands may reset it,
-      -- which breaks :w (it tries a filesystem write instead of BufWriteCmd).
-      vim.bo[bufnr].buftype = "acwrite"
+      set_buffer_content(bufnr, markdown)
 
       -- Register with sync module for external change detection
-      sync.register_buffer(bufnr)
-    end)
+      if vim.api.nvim_buf_is_valid(bufnr) then
+        sync.register_buffer(bufnr)
+      end
+    end, note_id)
   end)
 end
 
@@ -225,11 +256,7 @@ local function resolve_note_id(bufnr)
     return id
   end
   -- Last resort: extract from buffer name (always available)
-  local name_id = extract_note_id_from_name(bufnr)
-  if name_id then
-    return name_id
-  end
-  return nil
+  return extract_note_id_from_name(bufnr)
 end
 
 --- Save the buffer content back to Apple Notes.
@@ -260,7 +287,9 @@ end
 function M._setup_keymaps(bufnr)
   -- Checklist toggle: <C-Space>
   vim.keymap.set("n", "<C-Space>", function()
-    M._toggle_checkbox(bufnr)
+    if vim.api.nvim_buf_is_valid(bufnr) then
+      M._toggle_checkbox(bufnr)
+    end
   end, { buffer = bufnr, desc = "Toggle Apple Notes checkbox" })
 end
 
@@ -271,6 +300,10 @@ end
 ---
 --- @param bufnr number The buffer number
 function M._toggle_checkbox(bufnr)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
   local row = vim.api.nvim_win_get_cursor(0)[1]
   local line = vim.api.nvim_buf_get_lines(bufnr, row - 1, row, false)[1]
 
@@ -331,36 +364,52 @@ end
 --- @param title string|nil The note title (defaults to "Untitled Note")
 --- @param folder_name string|nil The folder name (nil for default folder)
 --- @param config table The plugin config
-function M.create_note(title, folder_name, config)
+--- @param body string|nil Optional markdown body (from template). Converted to HTML before creating.
+function M.create_note(title, folder_name, config, body)
   title = title or "Untitled Note"
-  -- Apple Notes derives the title from the note name — no need to duplicate it in the body.
-  -- Setting an <h1> causes Apple Notes to style it as a span, which round-trips badly.
-  local html = ""
 
-  applescript.create_note(title, html, folder_name, function(err)
-    if err then
-      vim.notify("Failed to create note: " .. err, vim.log.levels.ERROR)
-      return
-    end
-
-    vim.notify("Note created: " .. title, vim.log.levels.INFO)
-
-    -- Refresh and open the new note
-    local db = require("apple-notes.db")
-    db.invalidate_cache()
-    db.get_notes(function(db_err, notes)
-      if db_err or not notes then
+  --- Create the note via AppleScript and open it.
+  --- @param html string The HTML body content
+  local function do_create(html)
+    applescript.create_note(title, html, folder_name, function(err)
+      if err then
+        vim.notify("Failed to create note: " .. err, vim.log.levels.ERROR)
         return
       end
-      -- Find the newly created note (should be first — most recent)
-      for _, note in ipairs(notes) do
-        if note.title == title then
-          M.open_note(note, config)
+
+      vim.notify("Note created: " .. title, vim.log.levels.INFO)
+
+      -- Refresh and open the new note
+      local db = require("apple-notes.db")
+      db.invalidate_cache()
+      db.get_notes(function(db_err, notes)
+        if db_err or not notes then
           return
         end
-      end
+        -- Find the newly created note (should be first — most recent)
+        for _, note in ipairs(notes) do
+          if note.title == title then
+            M.open_note(note, config)
+            return
+          end
+        end
+      end)
     end)
-  end)
+  end
+
+  if body and body ~= "" then
+    -- Convert markdown body to HTML for Apple Notes
+    converter.md_to_html(body, function(conv_err, html)
+      if conv_err then
+        vim.notify("Template conversion failed: " .. conv_err, vim.log.levels.WARN)
+        do_create("")
+        return
+      end
+      do_create(html or "")
+    end)
+  else
+    do_create("")
+  end
 end
 
 return M

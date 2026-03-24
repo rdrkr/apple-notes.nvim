@@ -11,7 +11,6 @@
 ---
 --- Commands:
 ---   :AppleNotes        — Open note picker (Telescope)
----   :AppleNotesSearch  — Full-text search across notes
 ---   :AppleNotesNew     — Create a new note
 ---   :AppleNotesQuick   — Quick capture (append text to a note)
 ---   :AppleNotesTree    — Toggle tree sidebar (neo-tree)
@@ -40,6 +39,12 @@ local defaults = {
   --- Set to false to disable default keymaps.
   --- @type string|false
   keymap_prefix = "<leader>an",
+
+  --- Templates for creating new notes.
+  --- Each template has a name, optional folder, and body with variable substitution.
+  --- Variables: {{title}}, {{date}}, {{time}}
+  --- @type { name: string, folder?: string, body: string }[]
+  templates = {},
 }
 
 --- Active configuration (merged defaults + user config).
@@ -69,6 +74,51 @@ function M.setup(opts)
   -- Set up database watcher
   local db = require("apple-notes.db")
   db.setup_watcher()
+
+  -- Handle session restore for apple-notes:// buffers.
+  -- Without this, auto-session triggers E325 because Neovim tries to treat
+  -- the buffer name as a real file path and creates a swap file.
+  vim.api.nvim_create_autocmd("BufReadCmd", {
+    pattern = "apple-notes://*",
+    callback = function(args)
+      local bufnr = args.buf
+      vim.bo[bufnr].swapfile = false
+      vim.bo[bufnr].buftype = "acwrite"
+      vim.bo[bufnr].filetype = "markdown"
+      vim.bo[bufnr].modifiable = false
+
+      -- Try to re-open the note by extracting the ID from the buffer name
+      local name = vim.api.nvim_buf_get_name(bufnr)
+      local id_str = name:match("%[(%d+)%]$")
+      if not id_str then
+        -- No note ID in name — wipe the stale buffer
+        pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+        return
+      end
+
+      local note_id = tonumber(id_str)
+      local note_db = require("apple-notes.db")
+      note_db.get_notes(function(err, notes)
+        if not vim.api.nvim_buf_is_valid(bufnr) then
+          return
+        end
+        if err or not notes then
+          pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+          return
+        end
+        for _, note in ipairs(notes) do
+          if note.id == note_id then
+            pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+            local buffer = require("apple-notes.buffer")
+            buffer.open_note(note, M.config)
+            return
+          end
+        end
+        -- Note not found in DB — wipe stale buffer
+        pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+      end)
+    end,
+  })
 
   -- Set up neo-tree source (if neo-tree is available)
   local tree = require("apple-notes.tree")
@@ -114,6 +164,7 @@ function M._setup_highlights()
     AppleNotesTrash = { link = "WarningMsg" },
     AppleNotesChecked = { link = "String" },
     AppleNotesUnchecked = { link = "Todo" },
+    AppleNotesTag = { link = "Label" },
   }
 
   for name, opts in pairs(highlights) do
@@ -131,21 +182,58 @@ function M._setup_commands()
     local args = cmd_opts.fargs
     local folder_name = args[1] or M.config.default_folder
 
-    vim.ui.input({ prompt = "Note title: " }, function(title)
-      if not title or title == "" then
-        return
+    --- Prompt for title and create note with optional template body.
+    --- @param template_body string|nil The template body (nil for blank note)
+    --- @param template_folder string|nil The template's folder override
+    local function prompt_and_create(template_body, template_folder)
+      local effective_folder = folder_name or template_folder or M.config.default_folder
+      vim.ui.input({ prompt = "Note title: " }, function(title)
+        if not title or title == "" then
+          return
+        end
+        local body = nil
+        if template_body and template_body ~= "" then
+          body = M._substitute_template_vars(template_body, title)
+        end
+        require("apple-notes.buffer").create_note(title, effective_folder, M.config, body)
+      end)
+    end
+
+    if M.config.templates and #M.config.templates > 0 then
+      -- Build template choices: "Blank" first, then configured templates
+      local choices = { "Blank" }
+      for _, tmpl in ipairs(M.config.templates) do
+        table.insert(choices, tmpl.name)
       end
-      require("apple-notes.buffer").create_note(title, folder_name, M.config)
-    end)
+
+      vim.ui.select(choices, { prompt = "Select template:" }, function(choice)
+        if not choice then
+          return
+        end
+        if choice == "Blank" then
+          prompt_and_create(nil, nil)
+          return
+        end
+        -- Find the selected template
+        for _, tmpl in ipairs(M.config.templates) do
+          if tmpl.name == choice then
+            prompt_and_create(tmpl.body, tmpl.folder)
+            return
+          end
+        end
+      end)
+    else
+      prompt_and_create(nil, nil)
+    end
   end, {
     nargs = "?",
     desc = "Create a new Apple Note",
     complete = function()
       -- Complete with folder names
       local folders = {}
-      local db = require("apple-notes.db")
+      local db_mod = require("apple-notes.db")
       -- Use cached data if available
-      db.get_folders(function(_, result)
+      db_mod.get_folders(function(_, result)
         if result then
           for _, f in ipairs(result) do
             table.insert(folders, f.name)
@@ -167,6 +255,10 @@ function M._setup_commands()
     nargs = "+",
     desc = "Quick capture: append text to a note",
   })
+
+  vim.api.nvim_create_user_command("AppleNotesTags", function()
+    require("apple-notes.telescope").pick_tag(M.config)
+  end, { desc = "Browse Apple Notes by tag" })
 
   vim.api.nvim_create_user_command("AppleNotesTree", function()
     local has_neo_tree = pcall(require, "neo-tree")
@@ -209,6 +301,25 @@ function M._setup_keymaps()
     end)
   end, "Quick capture to Apple Note")
   map("t", "<cmd>AppleNotesTree<CR>", "Toggle Apple Notes tree")
+  map("#", "<cmd>AppleNotesTags<CR>", "Browse Apple Notes tags")
+end
+
+--- Substitute template variables in a string.
+---
+--- Supported variables:
+---   {{title}} — the note title
+---   {{date}}  — current date (YYYY-MM-DD)
+---   {{time}}  — current time (HH:MM)
+---
+--- @param body string The template body with {{variable}} placeholders
+--- @param title string The note title
+--- @return string The body with variables replaced
+function M._substitute_template_vars(body, title)
+  local result = body
+  result = result:gsub("{{title}}", title or "")
+  result = result:gsub("{{date}}", os.date("%Y-%m-%d"))
+  result = result:gsub("{{time}}", os.date("%H:%M"))
+  return result
 end
 
 --- Quick capture: append text to the configured capture note.

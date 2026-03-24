@@ -64,6 +64,7 @@ local SCHEMAS = {
 local cache = {
   notes = nil,
   folders = nil,
+  tags = nil,
   timestamp = 0,
   watcher = nil,
   timer = nil,
@@ -113,9 +114,10 @@ end
 
 --- Invalidate the note/folder cache and notify listeners.
 function M.invalidate_cache()
-  local had_data = cache.notes ~= nil or cache.folders ~= nil
+  local had_data = cache.notes ~= nil or cache.folders ~= nil or cache.tags ~= nil
   cache.notes = nil
   cache.folders = nil
+  cache.tags = nil
   cache.timestamp = 0
   -- Only notify if there was cached data (avoids spurious refreshes on startup)
   if had_data then
@@ -531,6 +533,199 @@ function M.search_notes(query, callback)
     end
 
     callback(nil, notes)
+  end)
+end
+
+--- Fetch image attachments for a note.
+---
+--- Queries the SQLite database for image attachments linked to the given note,
+--- including the account identifier needed to resolve the file path on disk.
+---
+--- File path pattern:
+---   ~/Library/Group Containers/group.com.apple.notes/Accounts/{account_id}/Media/{media_id}/{subfolder}/{filename}
+---
+--- @param note_id number The Z_PK of the note
+--- @param callback fun(err: string|nil, attachments: { filename: string, media_id: string, account_id: string, type_uti: string }[]|nil)
+function M.get_attachments(note_id, callback)
+  local sql = string.format(
+    [[
+    SELECT
+      att.ZTYPEUTI as type_uti,
+      media.ZFILENAME as filename,
+      media.ZIDENTIFIER as media_id,
+      acct.ZIDENTIFIER as account_id
+    FROM ZICCLOUDSYNCINGOBJECT att
+    JOIN ZICCLOUDSYNCINGOBJECT media ON att.ZMEDIA = media.Z_PK
+    JOIN ZICCLOUDSYNCINGOBJECT n ON att.ZNOTE = n.Z_PK
+    JOIN ZICCLOUDSYNCINGOBJECT folder ON n.ZFOLDER = folder.Z_PK
+    JOIN ZICCLOUDSYNCINGOBJECT acct ON folder.ZOWNER = acct.Z_PK
+    WHERE n.Z_PK = %d
+      AND att.Z_ENT = 5
+      AND (att.ZTYPEUTI LIKE 'public.png'
+        OR att.ZTYPEUTI LIKE 'public.jpeg'
+        OR att.ZTYPEUTI LIKE 'public.tiff'
+        OR att.ZTYPEUTI LIKE 'public.heic'
+        OR att.ZTYPEUTI = 'com.compuserve.gif')
+    ORDER BY att.Z_PK ASC
+  ]],
+    note_id
+  )
+
+  M.query(sql, function(err, rows)
+    if err then
+      callback(err, nil)
+      return
+    end
+
+    local attachments = {}
+    for _, row in ipairs(rows or {}) do
+      table.insert(attachments, {
+        filename = safe(row.filename, ""),
+        media_id = safe(row.media_id, ""),
+        account_id = safe(row.account_id, ""),
+        type_uti = safe(row.type_uti, ""),
+      })
+    end
+
+    callback(nil, attachments)
+  end)
+end
+
+--- Extract hashtag patterns from text with word boundary checking.
+---
+--- Matches #tagname preceded by whitespace or start-of-string, followed by
+--- whitespace, punctuation, or end-of-string. Excludes # inside URLs, hex
+--- colors, and other non-tag contexts.
+---
+--- @param text string The text to scan for tags
+--- @return table<string, boolean> Set of unique tags found
+local function extract_tags_from_text(text)
+  local tags = {}
+  if not text or text == "" then
+    return tags
+  end
+  -- Strip HTML tags first (note bodies come as HTML)
+  local plaintext = text:gsub("<[^>]+>", " ")
+  -- Match #tagname with word boundary: preceded by whitespace or punctuation.
+  -- Pad with space so start-of-string boundary check works.
+  local padded = " " .. plaintext
+  for tag in padded:gmatch("[%s%p]#(%w+)") do
+    if #tag >= 2 then
+      tags["#" .. tag] = true
+    end
+  end
+  return tags
+end
+
+--- Fetch all unique tags from note bodies via batch AppleScript.
+---
+--- Note bodies in the SQLite database are stored as gzip-compressed blobs,
+--- making SQL-based tag extraction impractical. Instead, this function uses
+--- a single AppleScript call to fetch all note bodies, then extracts
+--- #tagname patterns in Lua.
+---
+--- Results are cached and invalidated alongside the note cache by the
+--- fs_event watcher.
+---
+--- Tags are case-sensitive (#Work != #work), matching Apple Notes behavior.
+---
+--- @param callback fun(err: string|nil, tags: { tag: string, count: number, note_ids: string[] }[]|nil)
+function M.get_tags(callback)
+  if cache.tags then
+    callback(nil, cache.tags)
+    return
+  end
+
+  local applescript = require("apple-notes.applescript")
+  applescript.get_all_note_bodies(function(err, notes)
+    if err then
+      callback(err, nil)
+      return
+    end
+
+    -- Count tags across all notes and track which notes have each tag
+    local tag_counts = {}
+    local tag_note_ids = {}
+
+    for _, note in ipairs(notes or {}) do
+      local tags = extract_tags_from_text(note.body)
+      for tag, _ in pairs(tags) do
+        tag_counts[tag] = (tag_counts[tag] or 0) + 1
+        if not tag_note_ids[tag] then
+          tag_note_ids[tag] = {}
+        end
+        table.insert(tag_note_ids[tag], note.id)
+      end
+    end
+
+    -- Convert to sorted array
+    local result = {}
+    for tag, count in pairs(tag_counts) do
+      table.insert(result, { tag = tag, count = count, note_ids = tag_note_ids[tag] })
+    end
+    table.sort(result, function(a, b)
+      if a.count ~= b.count then
+        return a.count > b.count
+      end
+      return a.tag < b.tag
+    end)
+
+    cache.tags = result
+    callback(nil, result)
+  end)
+end
+
+--- Get notes that contain a specific tag.
+---
+--- Cross-references tag note IDs with the cached note list to return
+--- full note data for notes matching the tag.
+---
+--- @param tag string The tag to filter by (including the # prefix)
+--- @param callback fun(err: string|nil, notes: table[]|nil)
+function M.get_notes_by_tag(tag, callback)
+  M.get_tags(function(tag_err, tags)
+    if tag_err then
+      callback(tag_err, nil)
+      return
+    end
+
+    -- Find note Z_PKs for the requested tag
+    -- AppleScript returns Core Data URIs like "x-coredata://UUID/ICNote/p123"
+    -- Extract the Z_PK (number after "p") to match against get_notes() results
+    local note_zpks = {}
+    for _, t in ipairs(tags or {}) do
+      if t.tag == tag then
+        for _, uri in ipairs(t.note_ids) do
+          local zpk = uri:match("/p(%d+)$")
+          if zpk then
+            note_zpks[tonumber(zpk)] = true
+          end
+        end
+        break
+      end
+    end
+
+    if vim.tbl_isempty(note_zpks) then
+      callback(nil, {})
+      return
+    end
+
+    -- Cross-reference with full note data
+    M.get_notes(function(notes_err, notes)
+      if notes_err then
+        callback(notes_err, nil)
+        return
+      end
+
+      local filtered = {}
+      for _, note in ipairs(notes or {}) do
+        if note_zpks[note.id] then
+          table.insert(filtered, note)
+        end
+      end
+
+      callback(nil, filtered)
+    end)
   end)
 end
 

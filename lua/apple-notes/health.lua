@@ -187,6 +187,15 @@ function M._check_macos_version()
     vim.health.warn("Could not determine macOS version from Darwin release: " .. release)
   end
 
+  -- Check image support (read-only, requires access to attachment files)
+  local notes_base = vim.fn.expand("~/Library/Group Containers/group.com.apple.notes")
+  local accounts_dir = notes_base .. "/Accounts"
+  if vim.fn.isdirectory(accounts_dir) == 1 then
+    vim.health.ok("Image attachment directory accessible: " .. accounts_dir)
+  else
+    vim.health.info("Image attachment directory not found (images will show as [image] placeholders)")
+  end
+
   -- Check optional dependencies
   local has_telescope = pcall(require, "telescope")
   if has_telescope then

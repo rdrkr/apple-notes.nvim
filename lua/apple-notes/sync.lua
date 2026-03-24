@@ -47,18 +47,32 @@ local MOD_DATE_TOLERANCE_SECS = 5
 ---
 --- @param bufnr number The buffer number
 function M.register_buffer(bufnr)
-  local identifier = vim.b[bufnr].apple_note_identifier
-  if not identifier then
+  if not vim.api.nvim_buf_is_valid(bufnr) then
     return
   end
 
+  local ok, identifier = pcall(vim.api.nvim_buf_get_var, bufnr, "apple_note_identifier")
+  if not ok or not identifier then
+    return
+  end
+
+  local _, loaded_at = pcall(vim.api.nvim_buf_get_var, bufnr, "apple_note_loaded_at")
+
   registered_buffers[bufnr] = {
     identifier = identifier,
-    loaded_at = vim.b[bufnr].apple_note_loaded_at or os.time(),
+    loaded_at = loaded_at or os.time(),
   }
 
-  -- Set up BufEnter check
+  -- Set up BufEnter check (fires when switching buffers within Neovim)
   vim.api.nvim_create_autocmd("BufEnter", {
+    buffer = bufnr,
+    callback = function()
+      M._check_external_changes(bufnr)
+    end,
+  })
+
+  -- Set up FocusGained check (fires when returning to Neovim from another app)
+  vim.api.nvim_create_autocmd("FocusGained", {
     buffer = bufnr,
     callback = function()
       M._check_external_changes(bufnr)
@@ -125,37 +139,47 @@ function M._execute_save(bufnr, note_id, markdown)
 
   -- Convert markdown to HTML
   converter.md_to_html(markdown, function(conv_err, html)
+    -- Re-check state — buffer may have been unregistered during async conversion
+    if not save_state[bufnr] then
+      return
+    end
+
     if conv_err then
       vim.notify("Save failed: " .. conv_err, vim.log.levels.ERROR)
-      state.saving = false
+      save_state[bufnr].saving = false
       return
     end
 
     -- Write HTML to Apple Notes via AppleScript
     applescript.set_note_body(note_id, html or "", function(as_err)
+      -- Re-check state again — buffer may have been unregistered during save
+      if not save_state[bufnr] then
+        return
+      end
+
       if as_err then
         vim.notify("Save failed: " .. as_err, vim.log.levels.ERROR)
-        state.saving = false
+        save_state[bufnr].saving = false
         return
       end
 
       -- Update loaded_at timestamp
       if vim.api.nvim_buf_is_valid(bufnr) then
-        vim.b[bufnr].apple_note_loaded_at = os.time()
+        vim.api.nvim_buf_set_var(bufnr, "apple_note_loaded_at", os.time())
         vim.bo[bufnr].modified = false
         if registered_buffers[bufnr] then
           registered_buffers[bufnr].loaded_at = os.time()
         end
       end
 
-      vim.notify("Note saved ✓", vim.log.levels.INFO)
-      state.saving = false
-      state.last_saved_at = os.time()
+      vim.notify("Note saved", vim.log.levels.INFO)
+      save_state[bufnr].saving = false
+      save_state[bufnr].last_saved_at = os.time()
 
       -- Process pending save if queued
-      if state.pending_markdown then
-        local pending = state.pending_markdown
-        state.pending_markdown = nil
+      if save_state[bufnr].pending_markdown then
+        local pending = save_state[bufnr].pending_markdown
+        save_state[bufnr].pending_markdown = nil
         M._execute_save(bufnr, note_id, pending)
       end
     end)
@@ -169,6 +193,11 @@ end
 ---
 --- @param bufnr number The buffer number
 function M._check_external_changes(bufnr)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    registered_buffers[bufnr] = nil
+    return
+  end
+
   local reg = registered_buffers[bufnr]
   if not reg then
     return
@@ -194,6 +223,7 @@ function M._check_external_changes(bufnr)
     if mod_date and (mod_date - reg.loaded_at) > MOD_DATE_TOLERANCE_SECS then
       vim.schedule(function()
         if not vim.api.nvim_buf_is_valid(bufnr) then
+          registered_buffers[bufnr] = nil
           return
         end
 
@@ -214,8 +244,12 @@ end
 ---
 --- @param bufnr number The buffer number
 function M._reload_buffer(bufnr)
-  local note_id = vim.b[bufnr].apple_note_id
-  if not note_id then
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  local ok, note_id = pcall(vim.api.nvim_buf_get_var, bufnr, "apple_note_id")
+  if not ok or not note_id then
     return
   end
 
@@ -239,14 +273,14 @@ function M._reload_buffer(bufnr)
       vim.bo[bufnr].modifiable = true
       vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
       vim.bo[bufnr].modified = false
-      vim.b[bufnr].apple_note_loaded_at = os.time()
+      vim.api.nvim_buf_set_var(bufnr, "apple_note_loaded_at", os.time())
 
       if registered_buffers[bufnr] then
         registered_buffers[bufnr].loaded_at = os.time()
       end
 
       vim.notify("Note reloaded", vim.log.levels.INFO)
-    end)
+    end, note_id)
   end)
 end
 
@@ -256,8 +290,12 @@ end
 ---
 --- @param bufnr number The buffer number
 function M._show_diff(bufnr)
-  local note_id = vim.b[bufnr].apple_note_id
-  if not note_id then
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  local ok, note_id = pcall(vim.api.nvim_buf_get_var, bufnr, "apple_note_id")
+  if not ok or not note_id then
     return
   end
 
@@ -296,7 +334,7 @@ function M._show_diff(bufnr)
         vim.api.nvim_set_current_win(orig_win)
         vim.cmd("diffthis")
       end
-    end)
+    end, note_id)
   end)
 end
 

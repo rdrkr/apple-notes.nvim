@@ -195,8 +195,36 @@ function M._get_commands(config)
         return
       end
 
-      -- Notes: open in buffer
+      -- Notes: open in buffer (in a non-tree window)
       if node.extra and node.extra.note then
+        -- Find or create a window that isn't the neo-tree sidebar
+        local tree_win = vim.api.nvim_get_current_win()
+        local target_win = nil
+        for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+          if win ~= tree_win and vim.api.nvim_win_is_valid(win) then
+            local win_buf = vim.api.nvim_win_get_buf(win)
+            local bt = vim.bo[win_buf].buftype
+            -- Skip floating windows and special buffers (other sidebars)
+            local win_config = vim.api.nvim_win_get_config(win)
+            if not win_config.relative or win_config.relative == "" then
+              if bt ~= "nofile" or vim.bo[win_buf].filetype == "markdown" then
+                target_win = win
+                break
+              end
+            end
+          end
+        end
+
+        if target_win then
+          vim.api.nvim_set_current_win(target_win)
+        else
+          -- No suitable window found — create a split to the right of the tree
+          vim.cmd("wincmd l")
+          if vim.api.nvim_get_current_win() == tree_win then
+            vim.cmd("vsplit")
+          end
+        end
+
         buffer.open_note(node.extra.note, config)
       end
     end,

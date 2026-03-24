@@ -37,6 +37,9 @@ Notes appear as Markdown in virtual buffers — no files on disk, no GUI app nee
 - **📱 External Change Detection** — Detects edits from iPhone, iPad, or web
 - **📁 Folder Management** — Create, rename, delete, and move notes between folders
 - **☑️ Checklist Toggle** — Toggle checkboxes with `<C-Space>`
+- **🖼️ Image Display** — Images from Apple Notes shown as clickable file links
+- **🏷️ Tag Navigation** — Browse and filter notes by `#tag` (`:AppleNotesTags`)
+- **📄 Note Templates** — Create notes from configurable templates with variable substitution
 
 ---
 
@@ -59,6 +62,7 @@ in **System Settings → Privacy & Security → Full Disk Access** to read the N
 | ------------------------------------------------------------------ | ----------------------------------------------------------- |
 | [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim) | Note picker and search (`:AppleNotes`, `:AppleNotesSearch`) |
 | [neo-tree.nvim](https://github.com/nvim-neo-tree/neo-tree.nvim)    | Tree sidebar (`:AppleNotesTree`)                            |
+| [render-markdown.nvim](https://github.com/MeanderingProgrammer/render-markdown.nvim) | Enhanced markdown rendering in note buffers |
 
 ---
 
@@ -180,6 +184,12 @@ require("apple-notes").setup({
   -- Keymap prefix for global keymaps
   -- Set to false to disable default keymaps
   keymap_prefix = "<leader>an",
+
+  -- Templates for creating new notes
+  -- Variables: {{title}}, {{date}} (YYYY-MM-DD), {{time}} (HH:MM)
+  templates = {
+    -- { name = "Meeting", folder = "Work", body = "# {{title}}\n\nDate: {{date}}\n\n## Attendees\n\n## Notes\n\n## Action Items" },
+  },
 })
 ```
 
@@ -191,6 +201,7 @@ require("apple-notes").setup({
 | `capture_note`   | `string\|nil`   | `nil`          | Title of the note used for quick capture. Prompts on first use if `nil`.  |
 | `poll_interval`  | `number`        | `30000`        | Interval (ms) for checking external changes from other devices.           |
 | `keymap_prefix`  | `string\|false` | `"<leader>an"` | Prefix for global keymaps. Set to `false` to disable all default keymaps. |
+| `templates`      | `table[]`       | `{}`            | Note templates with `name`, optional `folder`, and `body` fields.         |
 
 ### Highlight Groups
 
@@ -204,6 +215,7 @@ All highlight groups can be overridden in your colorscheme:
 | `AppleNotesTrash`     | `WarningMsg` | Deleted notes indicator    |
 | `AppleNotesChecked`   | `String`     | Checked checkboxes         |
 | `AppleNotesUnchecked` | `Todo`       | Unchecked checkboxes       |
+| `AppleNotesTag`       | `Label`      | Tag names in tag picker    |
 
 ---
 
@@ -214,9 +226,9 @@ All highlight groups can be overridden in your colorscheme:
 | Command                   | Description                                  |
 | ------------------------- | -------------------------------------------- |
 | `:AppleNotes`             | Find and open a note (Telescope picker)      |
-| `:AppleNotesFind`         | Alias for `:AppleNotes`                      |
 | `:AppleNotesNew [folder]` | Create a new note (optional folder argument) |
 | `:AppleNotesQuick {text}` | Append text to your capture note             |
+| `:AppleNotesTags`         | Browse notes by `#tag` (Telescope picker)    |
 | `:AppleNotesTree`         | Toggle neo-tree sidebar                      |
 
 ### Editing Notes
@@ -249,6 +261,7 @@ Set `capture_note` in your config to skip the prompt.
 | `<leader>anf` | Find note (Telescope picker)     |
 | `<leader>ann` | New note                         |
 | `<leader>anq` | Quick capture (prompts for text) |
+| `<leader>an#` | Browse notes by tag              |
 | `<leader>ant` | Toggle tree sidebar              |
 
 ### In Note Buffer
@@ -283,8 +296,9 @@ apple-notes.nvim/
 │   ├── applescript.lua        # Apple Notes mutations via osascript
 │   ├── converter.lua          # HTML ↔ Markdown via pandoc
 │   ├── buffer.lua             # Virtual buffer lifecycle (buftype=acwrite)
+│   ├── images.lua             # Read-only image display (base64 → file path)
 │   ├── sync.lua               # Save queue + external change detection
-│   ├── telescope.lua          # Telescope pickers (browse + search)
+│   ├── telescope.lua          # Telescope pickers (browse, search, tags)
 │   ├── tree.lua               # neo-tree rendering + CRUD commands
 │   ├── job.lua                # Shared async shell-out utility
 │   ├── sanitize.lua           # SQL + AppleScript injection prevention
@@ -292,7 +306,10 @@ apple-notes.nvim/
 ├── lua/neo-tree/sources/apple-notes/
 │   └── init.lua               # neo-tree source entry point
 └── tests/
-    └── test_sanitize.lua      # Unit tests for input sanitization
+    ├── test_sanitize.lua      # Unit tests for input sanitization
+    ├── test_images.lua        # Unit tests for image stripping
+    ├── test_tags.lua          # Unit tests for tag extraction
+    └── test_templates.lua     # Unit tests for template substitution
 ```
 
 ### Data Flow
